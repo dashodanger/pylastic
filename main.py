@@ -9,9 +9,8 @@ import tkinter.ttk as ttk
 import tkinter.filedialog as tkf
 import pandas as pd
 
-# Functions that interact with Elasticsearch. They are written when possible in a functional style,
-# meaning that they simply receive input and return the proper output, and do not depend on the
-# state of any GUI elements.
+# Functions that interact with Elasticsearch. They are written to function independently of
+# the state of any GUI elements.
 
 # TODO: Implement HTTPS connections. Right now, the protocol variable exists but is unused
 
@@ -22,7 +21,7 @@ def request_builder(search_term, fields: str) -> str:
     query = dict()
     query['multi_match'] = {"query": search_term}
     body['_source'] = list(fields.split(','))
-    # Static value of 100 as a sane default, will create widget with 0-10000 hit range
+    # Static value of 100 as a sane default for my VM, need to create widget with 0-10000 hit range
     body['size'] = 100
     body['query'] = query
     return json.dumps(body)
@@ -44,18 +43,13 @@ def index_field_names(protocol: bool, ip, port, index: str) -> list:
     fieldlist = list()
     for key in list(requestjson.keys()):
         mappings = requestjson.get(key).get('mappings').get('properties')
-        # This will eventually need to be re-written in a recursive manner, as
-        # nested fields can go up to 20 levels deep by default in Elastic
         for f in mappings:
-            if 'properties' in mappings.get(f).keys():
-                for sf in mappings.get(f).get('properties').keys():
-                    fieldlist.append(f + '.' + sf)
-            else:
-                fieldlist.append(f)
+            fieldlist.append(nested_mapping_unwrapper(f, mappings.get(f), fieldlist))
     return fieldlist
 
 def simple_query_search(protocol: bool, ip, port, index, search_term, fields: str) -> pd.DataFrame:
-    """ Simple query match that should hit on any field in a document """
+    """ Runs a simple query match that should hit on any field in a document, even if it isn't
+    selected as one of the fields to return. Search results are returned as a Pandas DataFrame """
     search = http.HTTPConnection(ip + ':' + port)
     search.request(method="GET", url='/' + index + '/_search',
                    body=request_builder(search_term, fields),
@@ -65,24 +59,39 @@ def simple_query_search(protocol: bool, ip, port, index, search_term, fields: st
     results = pd.DataFrame()
     for hit in requestjson.pop('hits').pop('hits'):
         hitdict = dict()
-        # This will eventually need to be re-written in a recursive manner, as
-        # nested fields can go up to 20 levels deep by default in Elastic. Nested
-        # fields need to be unpacked, though, so that the pandas quicksort functions
-        # can actually work as intended
         for (f, v) in hit.pop('_source').items():
             if isinstance(v, dict):
-                for (sf, sf_v) in v.items():
-                    if isinstance(sf_v, dict):
-                        for (ssf, ssf_v) in sf_v.items():
-                            hitdict[f + '.' + sf + '.' + ssf] = ssf_v
-                    else:
-                        hitdict[f + '.' + sf] = sf_v
+                nested_docfield_unwrapper(f, hitdict, v)
             else:
                 hitdict[f] = v
         results = results.append(hitdict, ignore_index=True)
     return results
 
-# GUI elements below; perhaps split this into a separate .py file at some point
+# Helpers for the above Elasticsearch functions
+
+def nested_mapping_unwrapper(field: str, mappings: dict, fieldlist: list) -> list:
+    """ Unwraps the JSON for nested fields to create a list of fields separated by commas """
+    for f in mappings.keys():
+        if field in fieldlist:
+            continue
+        if f == 'properties':
+            for sf in mappings.get(f):
+                nested_mapping_unwrapper(field + '.' + sf, mappings.get(f), fieldlist)
+        else:
+            fieldlist.append(field)
+    return fieldlist
+
+def nested_docfield_unwrapper(field: str, hitdict, value: dict) -> dict:
+    """ Unwraps the JSON for nested fields in a document that was returned from a search """
+    if isinstance(value, dict):
+        for (sf, sf_v) in value.items():
+            nested_docfield_unwrapper(field + '.' + sf, hitdict, sf_v)
+    else:
+        if field not in hitdict:
+            hitdict[field] = value
+    return hitdict
+
+# GUI class and functions; perhaps split this into a separate .py file at some point
 
 # Probably need to re-factor at some point and make some of these nested classes. For instance,
 # PandasSession assumes that it was invoked by ResultsGrid. Although that will always be true
@@ -154,14 +163,13 @@ class PandasSession(tk.Toplevel):
 
     def init_session(self, results: dict):
         """ Creates a console session, loads the search results DataFrame that is
-        passed to it, bound to 'r', and loads numpy/pandas/pyplot with commonly
-        used aliases """
+        passed to it, and imports numpy/pandas/pyplot with commonly used aliases """
         self.console = code.InteractiveConsole(locals=results)
         self.console.push('import numpy as np')
         self.console.push('import pandas as pd')
         self.console.push('import matplotlib.pyplot as plt')
         # Trying to print a multiline string with an already escaped print statement
-        # got weird. I'll see if there's a better way to do the lines below
+        # got weird.
         self.console.push('print(\'Search results imported as r\')')
         self.console.push('print(\'Numpy imported as np\')')
         self.console.push('print(\'Pandas imported as pd\')')
@@ -206,7 +214,7 @@ class ScrollingChecklist(ttk.Frame):
         self.configure(style='White.TFrame', borderwidth=1, relief="sunken")
 
     def create_widgets(self):
-        """ Put checklist widgets here """
+        """ Create widgets """
         self.canvas = tk.Canvas(self, background="white", highlightthickness=0)
         self.yscroll = ttk.Scrollbar(self, orient="vertical")
         self.canvas.configure(yscrollcommand=self.yscroll.set)
@@ -245,7 +253,6 @@ class ScrollingChecklist(ttk.Frame):
 
 class ResultsGrid(ttk.Frame):
     """ A table view of the search results, with some DataFrame-related functions """
-
     def __init__(self, master=None):
         super().__init__(master)
         self.master = master
@@ -270,7 +277,7 @@ class ResultsGrid(ttk.Frame):
                                          command=lambda: self.console_session())
 
     def place_widgets(self):
-        """ Place widgets within frame, should appear as label on top with entry box under it """
+        """ Place widgets within frame """
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         self.treeview.grid(row=0, column=0, sticky="nwes", columnspan=2)
@@ -291,7 +298,7 @@ class ResultsGrid(ttk.Frame):
             self.treeview.insert(parent="", index="end", values=result.tolist())
 
     def column_sort_asc(self, header: str):
-        """ Do a dataframe sort by whichever column is clicked """
+        """ Do a dataframe sort by whichever column is clicked (ascending) """
         self.search_results.sort_values(by=header, kind="mergesort",
                                         inplace=True, ignore_index=True)
         self.populate()
@@ -299,7 +306,7 @@ class ResultsGrid(ttk.Frame):
                               command=lambda _header=header: self.column_sort_desc(_header))
 
     def column_sort_desc(self, header: str):
-        """ Do a dataframe sort by whichever column from the grid is clicked """
+        """ Do a dataframe sort by whichever column from the grid is clicked (descending) """
         self.search_results.sort_values(by=header, kind="mergesort",
                                         ascending=False, inplace=True, ignore_index=True)
         self.populate()
@@ -383,7 +390,7 @@ class SearchBuilder(ttk.Frame):
         self.indices.set_scroll_area()
 
     def get_field_names(self):
-        """ Sets output area to display field names for an index """
+        """ Populates field list checkboxes with mappings from selected indices """
         self.fields.clear()
         self.all = ttk.Checkbutton(self.fields.checklist, text="All",
                                    command=lambda: self.fields.uncheck_rest(),
@@ -393,6 +400,9 @@ class SearchBuilder(ttk.Frame):
         maplist = index_field_names(self.protocol.get(), self.ip.entry.get(),
                                     self.port.entry.get(), self.indices.return_checked())
         for entry in maplist:
+            # Skip the 3-dot lists added by nested_mapping_unwrapper()
+            if isinstance(entry, list):
+                continue
             if entry.startswith('@'): # Python doesn't like @ as part of a variable name
                 at_entry = ('internal_' + entry.strip('@'))
                 self.at_entry = ttk.Checkbutton(self.fields.checklist, text=entry,
